@@ -1,8 +1,5 @@
-# bot.py — Bot replicador multi-origem/multi-destino para rodar LOCALMENTE
-# Usa uma FILA + WORKER para encaminhar mensagens uma por vez,
-# com delay global e tentativas automáticas em caso de erro.
-
 import asyncio
+import os
 import logging
 import json
 from pathlib import Path
@@ -14,281 +11,258 @@ from telegram.ext import (
     ApplicationBuilder,
     Application,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
-# ========= CONFIG BÁSICA =========
-BOT_TOKEN = "8522495959:AAEsDCXOVmbK2okjVfaQGhZLDMBulN6ML7g"
-FORWARD_DELAY_SECONDS = 10
-MAPPINGS_FILE = Path("mappings.json")
-# ================================
+# ============================================================
+# 🔧 CONFIGURAÇÕES DO BOT
+# ============================================================
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN está vazio!")
+# Token já incluído conforme solicitado:
+BOT_TOKEN = "8522495959:AAEsDCXOVmbK2okjVfaQGhZLDMBulN6ML7g"
+
+# Se quiser deixar o Railway controlar o delay:
+FORWARD_DELAY_SECONDS = int(os.environ.get("FORWARD_DELAY_SECONDS", 30))
+
+# Arquivo onde os pares origem→destino ficam salvos
+MAPPINGS_FILE = Path("mappings.json")
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Fila global: cada item é (Message, [destinos])
+# FILA DE MENSAGENS
 message_queue: "asyncio.Queue[Tuple[Message, List[int]]]" = asyncio.Queue()
 
 
-# ---------- Persistência ----------
+# ============================================================
+# 🔧 Persistência dos links
+# ============================================================
+
 def load_links() -> Dict[str, List[int]]:
     if not MAPPINGS_FILE.exists():
         return {}
+
     try:
-        with MAPPINGS_FILE.open("r", encoding="utf-8") as f:
+        with open(MAPPINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+
         links = {str(k): [int(x) for x in v] for k, v in data.get("links", {}).items()}
         return links
+
     except Exception as e:
-        logger.error("Erro ao carregar mappings.json: %s", e)
+        logger.error(f"Erro ao carregar mappings.json: {e}")
         return {}
 
 
 def save_links(links: Dict[str, List[int]]) -> None:
     try:
-        with MAPPINGS_FILE.open("w", encoding="utf-8") as f:
+        with open(MAPPINGS_FILE, "w", encoding="utf-8") as f:
             json.dump({"links": links}, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logger.error("Erro ao salvar mappings.json: %s", e)
+        logger.error(f"Erro ao salvar mappings.json: {e}")
 
 
-# ---------- WORKER: pega da fila e encaminha UMA por vez ----------
-async def forward_worker(app: Application) -> None:
-    logger.info("Worker de encaminhamento iniciado (fila global).")
+# ============================================================
+# 🔧 Worker — encaminhamento pela FILA, uma mensagem por vez
+# ============================================================
+
+async def forward_worker(app: Application):
+    logger.info("Worker de encaminhamento iniciado...")
+
     while True:
+        msg, targets = await message_queue.get()
+
         try:
-            msg, targets = await message_queue.get()
-            try:
-                # Delay global antes de cada mensagem encaminhada
-                await asyncio.sleep(FORWARD_DELAY_SECONDS)
+            # delay global entre envios
+            await asyncio.sleep(FORWARD_DELAY_SECONDS)
 
-                for target_chat_id in targets:
-                    for attempt in range(3):  # até 3 tentativas por destino
-                        try:
-                            await app.bot.copy_message(
-                                chat_id=target_chat_id,
-                                from_chat_id=msg.chat_id,
-                                message_id=msg.message_id,
-                            )
-                            logger.info(
-                                "Mensagem encaminhada: %s -> %s (msg_id=%s)",
-                                msg.chat_id,
-                                target_chat_id,
-                                msg.message_id,
-                            )
-                            break  # sucesso, sai do loop de tentativas
+            for target in targets:
 
-                        except RetryAfter as e:
-                            espera = int(getattr(e, "retry_after", 5)) + 1
-                            logger.warning(
-                                "RetryAfter %ss antes de encaminhar novamente %s -> %s",
-                                espera, msg.chat_id, target_chat_id
-                            )
-                            await asyncio.sleep(espera)
+                for attempt in range(3):  # até 3 tentativas
+                    try:
+                        await app.bot.copy_message(
+                            chat_id=target,
+                            from_chat_id=msg.chat_id,
+                            message_id=msg.message_id
+                        )
 
-                        except TimedOut:
-                            logger.warning(
-                                "TimedOut ao encaminhar %s -> %s (msg_id=%s), tentativa %s/3",
-                                msg.chat_id,
-                                target_chat_id,
-                                msg.message_id,
-                                attempt + 1,
-                            )
-                            if attempt == 2:
-                                logger.error(
-                                    "Falha definitiva após 3 timeouts %s -> %s (msg_id=%s)",
-                                    msg.chat_id,
-                                    target_chat_id,
-                                    msg.message_id,
-                                )
-                            else:
-                                await asyncio.sleep(5)
+                        logger.info(f"Mensagem enviada {msg.chat_id} -> {target}")
+                        break
 
-                        except NetworkError as e:
-                            logger.warning(
-                                "NetworkError ao encaminhar %s -> %s (msg_id=%s): %s",
-                                msg.chat_id, target_chat_id, msg.message_id, e
-                            )
+                    except RetryAfter as e:
+                        wait = int(getattr(e, "retry_after", 5))
+                        logger.warning(f"RetryAfter: aguardando {wait}s...")
+                        await asyncio.sleep(wait)
+
+                    except TimedOut:
+                        logger.warning(f"Timeout ao enviar. Tentativa {attempt+1}/3")
+                        if attempt == 2:
+                            logger.error("Falhou após 3 timeouts.")
+                        else:
                             await asyncio.sleep(5)
 
-                        except Exception as e:
-                            logger.error(
-                                "Erro ao encaminhar %s -> %s (msg_id=%s): %s",
-                                msg.chat_id,
-                                target_chat_id,
-                                msg.message_id,
-                                e,
-                            )
-                            break
+                    except NetworkError as e:
+                        logger.warning(f"NetworkError: {e}")
+                        await asyncio.sleep(5)
 
-            finally:
-                message_queue.task_done()
+                    except Exception as e:
+                        logger.error(f"Erro inesperado ao encaminhar: {e}")
+                        break
 
         except Exception as e:
-            logger.error("Erro inesperado no worker de encaminhamento: %s", e)
-            # Pequena pausa pra evitar loop de erro sem fim
-            await asyncio.sleep(5)
+            logger.error(f"Erro no worker: {e}")
+
+        finally:
+            message_queue.task_done()
 
 
-# ---------- Comandos ----------
+# ============================================================
+# 🔧 Comandos do bot
+# ============================================================
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "BOT REPLICADOR MULTI-CANAIS/GRUPOS (com FILA)\n\n"
-        "Comandos:\n"
-        "/add_link ID_ORIGEM ID_DESTINO  -> cria link origem -> destino\n"
-        "/remove_link ID_ORIGEM ID_DESTINO  -> remove link\n"
-        "/list_links  -> lista links cadastrados\n"
-        "/on  -> liga encaminhamento\n"
-        "/off -> desliga encaminhamento\n"
-        "/status -> mostra status\n"
-        "/chatid -> mostra o ID deste chat\n"
-        f"\nDelay entre mensagens: {FORWARD_DELAY_SECONDS} segundos (fila global).\n"
-        "Obs.: se entrar 100 mensagens, elas vão sair uma por vez, respeitando o delay."
+    await update.message.reply_text(
+        "🤖 BOT REPLICADOR ATIVO\n\n"
+        "Comandos disponíveis:\n"
+        "/add_link ORIGEM DESTINO\n"
+        "/remove_link ORIGEM DESTINO\n"
+        "/list_links\n"
+        "/on\n"
+        "/off\n"
+        "/status\n"
+        "/chatid\n"
+        f"\nDelay atual: {FORWARD_DELAY_SECONDS} segundos"
     )
-    await update.effective_message.reply_text(text)
 
 
 async def cmd_add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.effective_message.reply_text("Uso: /add_link ID_ORIGEM ID_DESTINO")
-        return
+    if len(context.args) != 2:
+        return await update.message.reply_text("Uso correto:\n/add_link ORIGEM DESTINO")
+
     try:
         src = int(context.args[0])
         dst = int(context.args[1])
     except:
-        await update.effective_message.reply_text("IDs inválidos.")
-        return
+        return await update.message.reply_text("IDs inválidos.")
 
-    links = context.application.bot_data.get("links", {})
+    links = context.application.bot_data["links"]
     arr = links.get(str(src), [])
+
     if dst not in arr:
         arr.append(dst)
+
     links[str(src)] = arr
-
     save_links(links)
-    context.application.bot_data["links"] = links
 
-    await update.effective_message.reply_text(f"Link criado: {src} -> {dst}")
+    await update.message.reply_text(f"Par adicionado:\n{src} → {dst}")
 
 
 async def cmd_remove_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.effective_message.reply_text("Uso: /remove_link ID_ORIGEM ID_DESTINO")
-        return
+    if len(context.args) != 2:
+        return await update.message.reply_text("Uso:\n/remove_link ORIGEM DESTINO")
+
     try:
         src = int(context.args[0])
         dst = int(context.args[1])
     except:
-        await update.effective_message.reply_text("IDs inválidos.")
-        return
+        return await update.message.reply_text("IDs inválidos.")
 
-    links = context.application.bot_data.get("links", {})
-    if str(src) not in links:
-        await update.effective_message.reply_text("Origem não cadastrada.")
-        return
+    links = context.application.bot_data["links"]
 
-    if dst in links[str(src)]:
+    if str(src) in links and dst in links[str(src)]:
         links[str(src)].remove(dst)
+
         if not links[str(src)]:
             del links[str(src)]
 
         save_links(links)
-        context.application.bot_data["links"] = links
+        return await update.message.reply_text(f"Removido:\n{src} → {dst}")
 
-        await update.effective_message.reply_text(f"Link removido: {src} -> {dst}")
-    else:
-        await update.effective_message.reply_text("Esse link não existe.")
+    await update.message.reply_text("Par não encontrado.")
 
 
 async def cmd_list_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    links = context.application.bot_data.get("links", {})
-    if not links:
-        await update.effective_message.reply_text("Nenhum link cadastrado.")
-        return
+    links = context.application.bot_data["links"]
 
-    lines = ["Links cadastrados:"]
+    if not links:
+        return await update.message.reply_text("Nenhum par cadastrado.")
+
+    text = "🔗 PARES CADASTRADOS:\n\n"
     for src, arr in links.items():
         for dst in arr:
-            lines.append(f"{src} -> {dst}")
+            text += f"{src} → {dst}\n"
 
-    await update.effective_message.reply_text("\n".join(lines))
+    await update.message.reply_text(text)
 
 
 async def cmd_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.application.bot_data["forwarding_enabled"] = True
-    await update.effective_message.reply_text("Encaminhamento LIGADO.")
+    context.application.bot_data["forwarding"] = True
+    await update.message.reply_text("Encaminhamento ATIVADO.")
 
 
 async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.application.bot_data["forwarding_enabled"] = False
-    await update.effective_message.reply_text("Encaminhamento DESLIGADO.")
+    context.application.bot_data["forwarding"] = False
+    await update.message.reply_text("Encaminhamento DESATIVADO.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bd = context.application.bot_data
-    fwd = bd.get("forwarding_enabled", False)
-    links = bd.get("links", {})
-    total = sum(len(v) for v in links.values())
-    fila = message_queue.qsize()
-    text = (
-        "STATUS DO BOT\n\n"
-        f"Encaminhamento: {'LIGADO' if fwd else 'DESLIGADO'}\n"
-        f"Pares cadastrados: {total}\n"
-        f"Mensagens na fila: {fila}\n"
-        f"Delay entre envios: {FORWARD_DELAY_SECONDS} segundos\n"
+    await update.message.reply_text(
+        "📊 STATUS DO BOT\n\n"
+        f"Encaminhamento: {'ON' if bd['forwarding'] else 'OFF'}\n"
+        f"Pares ativos: {sum(len(v) for v in bd['links'].values())}\n"
+        f"Mensagens na fila: {message_queue.qsize()}\n"
+        f"Delay: {FORWARD_DELAY_SECONDS}s"
     )
-    await update.effective_message.reply_text(text)
 
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(f"ID deste chat: {update.effective_chat.id}")
+    await update.message.reply_text(f"ID deste chat: {update.effective_chat.id}")
 
 
-# ---------- Coleta de mensagens ----------
+# ============================================================
+# 🔧 Receber mensagens e jogar na fila
+# ============================================================
+
 async def collect_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bd = context.application.bot_data
-    if not bd.get("forwarding_enabled", False):
+
+    if not bd["forwarding"]:
         return
 
-    msg = update.effective_message
-    if msg is None:
-        return
-
+    msg = update.message
     src = str(msg.chat_id)
-    links = bd.get("links", {})
 
-    if src not in links:
+    if src not in bd["links"]:
         return
 
-    targets = links[src]
-
+    targets = bd["links"][src]
     await message_queue.put((msg, targets))
+
     logger.info(
-        "Mensagem adicionada à fila: origem=%s msg_id=%s destinos=%s (tamanho fila=%s)",
-        msg.chat_id, msg.message_id, targets, message_queue.qsize()
+        f"Mensagem adicionada à fila: origem={msg.chat_id}, fila={message_queue.qsize()}"
     )
 
 
-# ---------- Main ----------
+# ============================================================
+# 🔧 MAIN — inicializa o bot
+# ============================================================
+
 def main():
-    # Python 3.14: criar e registrar loop manualmente
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    links = load_links()
-    app.bot_data["links"] = links
-    app.bot_data["forwarding_enabled"] = False
+    app.bot_data["links"] = load_links()
+    app.bot_data["forwarding"] = False  # inicia desligado
 
+    # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("add_link", cmd_add_link))
     app.add_handler(CommandHandler("remove_link", cmd_remove_link))
@@ -298,12 +272,13 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
 
+    # Captura todas as mensagens normais
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, collect_messages))
 
-    # Inicia o worker da fila no mesmo loop
+    # Inicia o worker da fila
     loop.create_task(forward_worker(app))
 
-    logger.info("Bot replicador iniciado com FILA global!")
+    logger.info("🤖 Bot replicador inicializado no Railway!")
     app.run_polling()
 
 
